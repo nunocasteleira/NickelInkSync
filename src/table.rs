@@ -3,8 +3,9 @@
 //! the original itself. The desktop builds one per mapped book when it
 //! prepares a device ([`crate::prepare`]) and puts it on the device under
 //! `.adds/NickelInkSync/tables/<device checksum>.json`; the CLI on the
-//! device (`--live`) translates with it. The original EPUB never goes onto
-//! the device, and neither does its text.
+//! device (`--live`) translates with it. Desktop preparation does not copy
+//! the original EPUB or its text; the CWA live adapter may cache the original
+//! EPUB privately so it can build a table after a wireless Kobo download.
 //!
 //! The table holds, for each spine item of the original:
 //!

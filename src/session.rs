@@ -12,6 +12,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crate::config::{self, Config, LocalSettings, PushPosition};
+use crate::cwa;
 use crate::db::{Book, Device, Write};
 use crate::epub::Epub;
 use crate::hash::partial_md5;
@@ -109,7 +110,13 @@ impl Server {
       false => config::permission_warning(&path),
     };
     let timeout = options.timeout.max(Duration::from_secs(1));
-    let client = Client::with_timeout(&config.server, &config.user, &config.key, timeout);
+    let client = Client::with_timeout_and_password(
+      &config.server,
+      &config.user,
+      &config.key,
+      config.password.as_deref(),
+      timeout,
+    );
     Ok(Some(Server {
       config,
       client,
@@ -417,6 +424,11 @@ impl Session {
       options.book.as_deref(),
       options.content_id.as_deref(),
     );
+    if options.live {
+      if let Err(error) = cwa::auto_map(&device, &books, options.timeout) {
+        eprintln!("nickelinksync: CWA auto-mapping unavailable: {error}");
+      }
+    }
     let settings = options.local_settings()?;
     // The mappings and the library live on the desktop; on the device the
     // CLI has what `device prepare` left there.
@@ -489,7 +501,7 @@ impl Session {
     }
     // A kepub never reaches the server under its own checksum: KOReader
     // knows the book by its original EPUB, so only a mapping syncs it.
-    if book.is_kepub() || book.onboard_path().ends_with(".kepub.epub") {
+    if book.is_kepub() || book.storage_path().ends_with(".kepub.epub") {
       return Identity::Skip {
         hash: Some(hash),
         kind: "not-mapped",
@@ -552,7 +564,7 @@ impl Session {
         },
       };
     }
-    if book.is_kepub() || book.onboard_path().ends_with(".kepub.epub") {
+    if book.is_kepub() || book.storage_path().ends_with(".kepub.epub") {
       return Identity::Skip {
         hash: Some(hash),
         kind: "not-mapped",
@@ -1239,7 +1251,7 @@ pub fn select(mut books: Vec<Book>, filter: Option<&str>, content_id: Option<&st
   if let Some(filter) = filter {
     let filter = filter.to_lowercase();
     books.retain(|b| {
-      b.onboard_path().to_lowercase().contains(&filter)
+      b.storage_path().to_lowercase().contains(&filter)
         || b
           .title
           .as_deref()

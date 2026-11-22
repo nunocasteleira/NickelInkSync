@@ -9,6 +9,7 @@ pub mod check;
 pub mod config;
 pub mod copy;
 pub mod credentials;
+pub mod cwa;
 pub mod db;
 pub mod dom;
 pub mod epub;

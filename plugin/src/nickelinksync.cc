@@ -85,7 +85,7 @@
  * local event loop, so the UI keeps running; leaving does not wait.
  *
  * Messages: each outcome is shown as one of Nickel's toasts
- * (MainWindowController::toast), German only for now; `notify` in config.ini
+ * (MainWindowController::toast), in English; `notify` in config.ini
  * picks which: `all` (default), `errors` (only what went wrong or was left
  * undone) or `none`. The CLI names the outcome in `NICKELINKSYNC_…` lines.
  *
@@ -232,6 +232,34 @@ static const char kPushTimeout[] = "15";
 static const int kPushWaitMs = 60000;
 // How long after opening the pending list is sent: the book is drawn by then.
 static const int kPendingDelayMs = 5000;
+// Libra Colour 4.46 can return from saveProgress before its SQLite WAL is
+// visible to the helper process; let Nickel finish the close transaction.
+static const int kPushAfterLeaveDelayMs = 1000;
+
+static bool is_sideloaded_id(const QString &id)
+{
+    if (id.startsWith(QString::fromLatin1(kSideloaded))) {
+        return true;
+    }
+    if (id.size() != 36) {
+        return false;
+    }
+    for (int i = 0; i < id.size(); ++i) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (id.at(i) != QLatin1Char('-')) {
+                return false;
+            }
+            continue;
+        }
+        const ushort c = id.at(i).unicode();
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+              (c >= 'A' && c <= 'F'))) {
+            return false;
+        }
+    }
+    return QFile::exists(QString::fromLatin1(kOnboard) +
+                         QStringLiteral("/.kobo/kepub/") + id);
+}
 
 // Originals, filled by NickelHook (.out).
 static void (*ReadingController__setVolume)(ReadingController *, const Volume *, const Bookmark *);
@@ -457,18 +485,18 @@ static QString error_reason(const QByteArray &out)
     const QList<QList<QByteArray>> errors = machine_lines(out, "ERROR");
     const QByteArray kind = errors.isEmpty() ? QByteArray() : errors[0].value(0);
     if (kind == "timeout") {
-        return QStringLiteral("Server antwortet nicht");
+        return QStringLiteral("Server did not respond");
     }
     if (kind == "network") {
-        return QStringLiteral("Keine Verbindung zum Server");
+        return QStringLiteral("No connection to server");
     }
     if (kind == "auth") {
-        return QStringLiteral("Anmeldung abgelehnt");
+        return QStringLiteral("Authentication rejected");
     }
     if (kind == "server") {
-        return QStringLiteral("Unerwartete Antwort vom Server");
+        return QStringLiteral("Unexpected server response");
     }
-    return QStringLiteral("Fehler, siehe NickelInkSync.log");
+    return QStringLiteral("Error; see NickelInkSync.log");
 }
 
 // Why a position was not taken or sent, from the reason field of
@@ -476,34 +504,34 @@ static QString error_reason(const QByteArray &out)
 static QString skip_reason(const QByteArray &reason)
 {
     if (reason == "server-newer") {
-        return QStringLiteral("Server hat einen neueren Stand");
+        return QStringLiteral("Server has a newer position");
     }
     if (reason == "not-in-line") {
-        return QStringLiteral("Beim Öffnen nicht abgeglichen");
+        return QStringLiteral("Not in sync when opened");
     }
     if (reason == "not-translated") {
-        return QStringLiteral("Position passt nicht zum Buch");
+        return QStringLiteral("Position does not match the book");
     }
     // Only an original from the library index (`device prepare`) or a
     // mapped book syncs; a kepub always needs a mapping.
     if (reason == "not-mapped") {
-        return QStringLiteral("Buch nicht zugeordnet");
+        return QStringLiteral("Book not mapped");
     }
     if (reason == "no-table") {
-        return QStringLiteral("Zuordnung nicht vorbereitet");
+        return QStringLiteral("Mapping not prepared");
     }
     // An answer to the conflict dialog about a server position that
     // changed while it was open.
     if (reason == "server-changed") {
-        return QStringLiteral("Server hat sich inzwischen geändert");
+        return QStringLiteral("Server changed meanwhile");
     }
-    return QStringLiteral("Buch oder Position nicht lesbar");
+    return QStringLiteral("Book or position cannot be read");
 }
 
-static const QString kUnansweredReason = QStringLiteral("Braucht Bestätigung (confirm)");
+static const QString kUnansweredReason = QStringLiteral("Needs confirmation (confirm)");
 // A device without `device prepare` (NICKELINKSYNC_NO_INDEX).
-static const QString kNotPrepared = QStringLiteral("Gerät nicht vorbereitet");
-static const QString kPrepareHint = QStringLiteral("Am Rechner „Gerät vorbereiten“");
+static const QString kNotPrepared = QStringLiteral("Device not prepared");
+static const QString kPrepareHint = QStringLiteral("Prepare the device on your computer");
 
 static bool exists(const char *path)
 {
@@ -547,7 +575,7 @@ static void notice_kobalt(int delay_ms)
         return;
     }
     mark.close();
-    toast(true, QStringLiteral("NickelInkSync ist aus"), QStringLiteral("Kobalt ist installiert, siehe README"),
+    toast(true, QStringLiteral("NickelInkSync disabled"), QStringLiteral("Kobalt is installed; see README"),
           delay_ms);
 }
 
@@ -868,7 +896,7 @@ static void taken_from_server(const QString &id, const QString &at, const QStrin
     g_taken_id = id;
     g_taken_page = at;
     set_not_in_line(id, QString());
-    toast(false, QStringLiteral("Fortschritt übernommen"), taken);
+    toast(false, QStringLiteral("Progress applied"), taken);
 }
 
 // After opening: Nickel shows a page start, which lies before the pulled
@@ -902,14 +930,14 @@ static void check_open(const QString &id, const QString &target, const QString &
         log_line(QStringLiteral("after opening: Nickel is at %1, in the pulled chapter but not near the point; "
                                 "not pushed until a pull brings it in line").arg(at));
         set_not_in_line(id, at);
-        toast(true, QStringLiteral("Nicht übernommen"),
-              QStringLiteral("Andere Stelle im Kapitel geöffnet"));
+        toast(true, QStringLiteral("Not applied"),
+              QStringLiteral("Another position in this chapter was opened"));
     } else {
         log_line(QStringLiteral("after opening: Nickel is at %1, not in the pulled chapter; "
                                 "not pushed until a pull brings it in line").arg(at));
         set_not_in_line(id, at);
-        toast(true, QStringLiteral("Nicht übernommen"),
-              QStringLiteral("Anderes Kapitel geöffnet"));
+        toast(true, QStringLiteral("Not applied"),
+              QStringLiteral("Another chapter was opened"));
     }
 }
 
@@ -1235,6 +1263,9 @@ static bool write_through_nickel(const QString &id, const Pulled &p)
         Repository__refreshCache_Volume(db);
         return false;
     }
+    // Libra Colour 4.46 keeps a stale Volume in Nickel's repository after
+    // updateFields; refresh it before getById hands the book back to Nickel.
+    Repository__refreshCache_Volume(db);
     log_line(QStringLiteral("write: %1 through Nickel, %2 cached page(s) dropped").arg(position).arg(p.stale_pages.size()));
     return true;
 }
@@ -1258,11 +1289,11 @@ static void pending_finished(QProcess *p)
         }
     }
     if (sent > 0) {
-        toast(false, QStringLiteral("Vorgemerktes gesendet"),
-              sent == 1 ? QStringLiteral("1 Buch") : QStringLiteral("%1 Bücher").arg(sent));
+        toast(false, QStringLiteral("Pending progress sent"),
+              sent == 1 ? QStringLiteral("1 book") : QStringLiteral("%1 books").arg(sent));
     }
     if (conflicts > 0) {
-        toast(true, QStringLiteral("Vorgemerkt: Konflikt"), QStringLiteral("Server und Gerät bewegt, bleibt liegen"));
+        toast(true, QStringLiteral("Pending conflict"), QStringLiteral("Server and device both moved; left unchanged"));
     }
 }
 
@@ -1480,7 +1511,7 @@ struct ConflictAsk {
     bool answered;
     // What a tap on one of our connected buttons asked for (the dialog's
     // result code), or -1. On the Clara BW the dialog ended with 0 on every
-    // tap, also on "Server übernehmen" and our own button, before the tap
+    // tap, also on "Use server" and our own button, before the tap
     // reached its slot: the dialog's result cannot be trusted, the tap is.
     int intent;
 };
@@ -1505,7 +1536,7 @@ static bool open_fresh(ReadingController *self, const QString &id)
     return known;
 }
 
-// "Server übernehmen": pulls again with the answer and takes the position
+// "Use server": pulls again with the answer and takes the position
 // as a normal opening does, then opens the book.
 static void take_server_answer(const std::shared_ptr<ConflictAsk> &c)
 {
@@ -1517,19 +1548,19 @@ static void take_server_answer(const std::shared_ptr<ConflictAsk> &c)
     const Pulled p = pull(id, QStringList{QStringLiteral("--answered"), QString::fromLatin1(server_time)});
     if (!p.ok || p.conflict || !p.found) {
         g_not_synced = id;
-        g_not_synced_why = QStringLiteral("Konflikt, bleibt liegen");
+        g_not_synced_why = QStringLiteral("Conflict; left unchanged");
         log_line(QStringLiteral("open %1 unchanged: the answer could not be carried out").arg(id));
         open_fresh(c->self, id);
-        toast(true, QStringLiteral("Nicht übernommen"),
+        toast(true, QStringLiteral("Not applied"),
               p.ok ? (p.not_taken.isEmpty() ? g_not_synced_why : skip_reason(p.not_taken)) : p.error, kOpenToastDelayMs);
         return;
     }
     log_line(QStringLiteral("open %1 at %2 (%3 %), the reader took the server's").arg(id, QString::fromUtf8(p.position)).arg(p.percent));
     g_not_synced = id;
-    g_not_synced_why = QStringLiteral("Beim Öffnen nicht abgeglichen");
+    g_not_synced_why = QStringLiteral("Not in sync when opened");
     if (!write_through_nickel(id, p)) {
         open_fresh(c->self, id);
-        toast(true, QStringLiteral("Nicht übernommen"), QStringLiteral("Nickel schreibt nicht, siehe Log"),
+        toast(true, QStringLiteral("Not applied"), QStringLiteral("Nickel could not write; see log"),
               kOpenToastDelayMs);
         return;
     }
@@ -1539,7 +1570,7 @@ static void take_server_answer(const std::shared_ptr<ConflictAsk> &c)
     open_fresh(c->self, id);
     const QString target = QString::fromUtf8(p.position);
     const QString taken = p.from.isEmpty() ? QStringLiteral("%1 %").arg(p.percent)
-                                           : QStringLiteral("%1 %, von %2").arg(p.percent).arg(p.from);
+                                           : QStringLiteral("%1 %, from %2").arg(p.percent).arg(p.from);
     QTimer::singleShot(kCheckOpenMs, qApp, [id, target, taken] { check_open(id, target, taken, kCheckOpenTries); });
 }
 
@@ -1574,7 +1605,7 @@ static void conflict_answered(const std::shared_ptr<ConflictAsk> &c, int dialog_
                          QString::fromUtf8(c->pulled.conflict_fields.value(8)));
         }
         g_not_synced = id;
-        g_not_synced_why = QStringLiteral("Konflikt, später entscheiden");
+        g_not_synced_why = QStringLiteral("Conflict; decide later");
         log_line(QStringLiteral("open %1 unchanged: a conflict, left alone; leaving it will not push").arg(id));
         open_fresh(c->self, id);
     }
@@ -1655,21 +1686,21 @@ static bool show_conflict_dialog(const std::shared_ptr<ConflictAsk> &c)
     }
     const QByteArray why = f.value(1);
     const QString reason = why == "both-moved"
-        ? QStringLiteral("Seit dem letzten Abgleich wurde hier und auf einem anderen Gerät weitergelesen.")
-        : why == "always" ? QStringLiteral("Jede Änderung wird bestätigt (confirm = always).")
-                          : QStringLiteral("Die Stelle vom Server liegt vor der auf diesem Gerät.");
+        ? QStringLiteral("Since the last sync, this device and another device moved forward.")
+        : why == "always" ? QStringLiteral("Every change requires confirmation (confirm = always).")
+                          : QStringLiteral("The server position is before the device position.");
     // ConfirmationDialog shows "\n" as a space (C0); the label takes HTML.
-    const QString text = QStringLiteral("%1<br><br><b>Dieses Gerät:</b> %2<br><b>Server:</b> %3")
+    const QString text = QStringLiteral("%1<br><br><b>This device:</b> %2<br><b>Server:</b> %3")
                              .arg(reason.toHtmlEscaped(),
                                   side_of(f.value(2), f.value(9), QString(), f.value(3)).toHtmlEscaped(),
                                   side_of(f.value(5), f.value(8), QString::fromUtf8(f.value(7)), f.value(6))
                                       .toHtmlEscaped());
-    ConfirmationDialog__setTitle(d, why == "both-moved" ? QStringLiteral("Lesestand: Konflikt")
-                                                        : QStringLiteral("Lesestand vom Server übernehmen?"));
+    ConfirmationDialog__setTitle(d, why == "both-moved" ? QStringLiteral("Reading position: conflict")
+                                                        : QStringLiteral("Use the server reading position?"));
     ConfirmationDialog__setText(d, text);
-    ConfirmationDialog__setAcceptButtonText(d, QStringLiteral("Server übernehmen"));
-    ConfirmationDialog__setRejectButtonText(d, QStringLiteral("Später"));
-    QWidget *keep = third_button(d, QStringLiteral("Gerät behalten"));
+    ConfirmationDialog__setAcceptButtonText(d, QStringLiteral("Use server"));
+    ConfirmationDialog__setRejectButtonText(d, QStringLiteral("Later"));
+    QWidget *keep = third_button(d, QStringLiteral("Keep device"));
     if (!keep) {
         delete d;
         return false;
@@ -1730,7 +1761,7 @@ void _nh_ReadingController__setVolume(ReadingController *self, const Volume *vol
     g_unasked_id.clear();
     g_taken_id.clear();
     g_taken_page.clear();
-    if (!id.startsWith(QString::fromLatin1(kSideloaded))) {
+    if (!is_sideloaded_id(id)) {
         open_original(self, volume, bookmark);
         return;
     }
@@ -1763,8 +1794,8 @@ void _nh_ReadingController__setVolume(ReadingController *self, const Volume *vol
         // Without Wi-Fi the CLI only sees a timeout or no route; Nickel's
         // check is not reliable either way, so the text names both.
         const bool no_wifi = !wifi && (p.error_kind == "timeout" || p.error_kind == "network");
-        toast(true, QStringLiteral("Laden fehlgeschlagen"),
-              no_wifi ? QStringLiteral("Kein WLAN oder kein Server") : p.error, kOpenToastDelayMs);
+        toast(true, QStringLiteral("Loading failed"),
+              no_wifi ? QStringLiteral("No Wi-Fi or server") : p.error, kOpenToastDelayMs);
         return;
     }
     // The server answered: send what is pending once the book is up (after
@@ -1778,19 +1809,19 @@ void _nh_ReadingController__setVolume(ReadingController *self, const Volume *vol
             QTimer::singleShot(0, qApp, [ask] {
                 if (!show_conflict_dialog(ask)) {
                     g_not_synced = ask->id;
-                    g_not_synced_why = QStringLiteral("Konflikt, bleibt liegen");
+                    g_not_synced_why = QStringLiteral("Conflict; left unchanged");
                     open_fresh(ask->self, ask->id);
-                    toast(true, QStringLiteral("Konflikt, nicht geladen"),
-                          QStringLiteral("Server und Gerät bewegt, bleibt liegen"), kOpenToastDelayMs);
+                    toast(true, QStringLiteral("Conflict; not loaded"),
+                          QStringLiteral("Server and device both moved; left unchanged"), kOpenToastDelayMs);
                 }
             });
             return;
         }
         g_not_synced = id;
-        g_not_synced_why = QStringLiteral("Konflikt, bleibt liegen");
+        g_not_synced_why = QStringLiteral("Conflict; left unchanged");
         log_line(QStringLiteral("open %1 unchanged: a conflict, left alone; leaving it will not push").arg(id));
         open_original(self, volume, bookmark);
-        toast(true, QStringLiteral("Konflikt, nicht geladen"), QStringLiteral("Server und Gerät bewegt, bleibt liegen"),
+        toast(true, QStringLiteral("Conflict; not loaded"), QStringLiteral("Server and device both moved; left unchanged"),
               kOpenToastDelayMs);
         QTimer::singleShot(kPendingDelayMs, qApp, [] { sync_pending(); });
         return;
@@ -1801,7 +1832,7 @@ void _nh_ReadingController__setVolume(ReadingController *self, const Volume *vol
         g_not_synced_why = kUnansweredReason;
         log_line(QStringLiteral("open %1 unchanged: the position needs an answer (confirm); leaving it will not push").arg(id));
         open_original(self, volume, bookmark);
-        toast(true, QStringLiteral("Nicht übernommen"), kUnansweredReason, kOpenToastDelayMs);
+        toast(true, QStringLiteral("Not applied"), kUnansweredReason, kOpenToastDelayMs);
         return;
     }
     if (!p.not_taken.isEmpty()) {
@@ -1816,28 +1847,28 @@ void _nh_ReadingController__setVolume(ReadingController *self, const Volume *vol
             g_no_index_noticed = true;
             toast(true, kNotPrepared, kPrepareHint, kOpenToastDelayMs);
         } else {
-            toast(true, QStringLiteral("Nicht übernommen"), g_not_synced_why, kOpenToastDelayMs);
+            toast(true, QStringLiteral("Not applied"), g_not_synced_why, kOpenToastDelayMs);
         }
         return;
     }
     if (!p.found) {
         // The server holds nothing newer: the device is in line with it.
         open_original(self, volume, bookmark);
-        toast(false, QStringLiteral("Fortschritt ist aktuell"),
-              QStringLiteral("Server hat nichts Neueres"), kOpenToastDelayMs);
+        toast(false, QStringLiteral("Progress is current"),
+              QStringLiteral("Server has nothing newer"), kOpenToastDelayMs);
         return;
     }
     log_line(QStringLiteral("open %1 at %2 (%3 %)").arg(id, QString::fromUtf8(p.position)).arg(p.percent));
     // Not in line with the server until check_open() finds Nickel at the
     // pulled place.
     g_not_synced = id;
-    g_not_synced_why = QStringLiteral("Beim Öffnen nicht abgeglichen");
+    g_not_synced_why = QStringLiteral("Not in sync when opened");
     if (g_kobo) {
         if (!write_through_nickel(id, p)) {
             g_not_synced = id;
-            g_not_synced_why = QStringLiteral("Beim Öffnen nicht abgeglichen");
+            g_not_synced_why = QStringLiteral("Not in sync when opened");
             open_original(self, volume, bookmark);
-            toast(true, QStringLiteral("Nicht übernommen"), QStringLiteral("Nickel schreibt nicht, siehe Log"),
+            toast(true, QStringLiteral("Not applied"), QStringLiteral("Nickel could not write; see log"),
                   kOpenToastDelayMs);
             return;
         }
@@ -1881,7 +1912,7 @@ void _nh_ReadingController__setVolume(ReadingController *self, const Volume *vol
     }
     const QString target = QString::fromUtf8(p.position);
     const QString taken = p.from.isEmpty() ? QStringLiteral("%1 %").arg(p.percent)
-                                           : QStringLiteral("%1 %, von %2").arg(p.percent).arg(p.from);
+                                           : QStringLiteral("%1 %, from %2").arg(p.percent).arg(p.from);
     QTimer::singleShot(kCheckOpenMs, qApp, [id, target, taken] { check_open(id, target, taken, kCheckOpenTries); });
 }
 
@@ -1891,7 +1922,7 @@ static void push_finished(const QString &id, QProcess *p)
 {
     const QByteArray out = p->readAll();
     log_line(QStringLiteral("push %1 (exit %2):\n%3").arg(id).arg(p->exitCode()).arg(QString::fromUtf8(out).trimmed()));
-    const QString not_sent = QStringLiteral("Nicht gesendet");
+    const QString not_sent = QStringLiteral("Not sent");
     if (!machine_lines(out, "NO_INDEX").isEmpty()) {
         notice_no_index(out);
         return;
@@ -1899,29 +1930,29 @@ static void push_finished(const QString &id, QProcess *p)
     if (!machine_lines(out, "PENDING").isEmpty()) {
         const QList<QList<QByteArray>> errors = machine_lines(out, "ERROR");
         const QByteArray kind = errors.isEmpty() ? QByteArray() : errors[0].value(0);
-        toast(true, QStringLiteral("Fortschritt vorgemerkt"),
-              kind == "server" ? QStringLiteral("Serverfehler, wird nachgeholt")
-                               : QStringLiteral("Kein WLAN/Server, wird nachgeholt"));
+        toast(true, QStringLiteral("Progress pending"),
+              kind == "server" ? QStringLiteral("Server error; will retry")
+                               : QStringLiteral("No Wi-Fi/server; will retry"));
         return;
     }
     if (p->exitStatus() != QProcess::NormalExit || p->exitCode() != 0) {
-        toast(true, QStringLiteral("Senden fehlgeschlagen"), error_reason(out));
+        toast(true, QStringLiteral("Sending failed"), error_reason(out));
         return;
     }
     log_conflicts(out);
     const QList<QList<QByteArray>> sent = machine_lines(out, "SENT");
     const QList<QList<QByteArray>> skipped = machine_lines(out, "NOT_SENT");
     if (!sent.isEmpty()) {
-        toast(false, QStringLiteral("Fortschritt gesendet"),
+        toast(false, QStringLiteral("Progress sent"),
               QStringLiteral("%1 %").arg(QString::fromUtf8(sent[0].value(0))));
     } else if (!skipped.isEmpty()) {
         toast(true, not_sent, skip_reason(skipped[0].value(0)));
     } else if (!machine_lines(out, "CONFLICT").isEmpty()) {
-        toast(true, not_sent, QStringLiteral("Konflikt: Server und Gerät bewegt"));
+        toast(true, not_sent, QStringLiteral("Conflict: server and device both moved"));
     } else if (!machine_lines(out, "UNANSWERED").isEmpty()) {
         toast(true, not_sent, kUnansweredReason);
     } else if (!machine_lines(out, "IN_SYNC").isEmpty()) {
-        toast(false, QStringLiteral("Fortschritt ist aktuell"), QStringLiteral("Server hat schon diesen Stand"));
+        toast(false, QStringLiteral("Progress is current"), QStringLiteral("Server already has this position"));
     }
     sync_pending();
 }
@@ -1966,14 +1997,14 @@ void _nh_ReadingView__leavingReadingExperience(ReadingView *self)
     const bool on_unasked_page = !g_unasked_at.isEmpty() && g_unasked_id == g_open_id && leaving_at == g_unasked_at;
     // First Nickel saves the position.
     ReadingView__leavingReadingExperience(self);
-    if (!g_open_id.startsWith(QString::fromLatin1(kSideloaded))) {
+    if (!is_sideloaded_id(g_open_id)) {
         return;
     }
     const QString id = g_open_id;
     log_saved_row(id);
     if (on_taken_page) {
         log_line(QStringLiteral("left %1 on the page taken from the server (%2): nothing to push").arg(id, g_taken_page));
-        toast(false, QStringLiteral("Fortschritt ist aktuell"), QStringLiteral("Noch auf der Seite vom Server"));
+        toast(false, QStringLiteral("Progress is current"), QStringLiteral("Still on the server's page"));
         if (online()) {
             sync_pending();
         }
@@ -1981,7 +2012,7 @@ void _nh_ReadingView__leavingReadingExperience(ReadingView *self)
     }
     if (g_not_synced == id) {
         log_line(QStringLiteral("left %1, which is not in line with the server: not pushed").arg(id));
-        toast(true, QStringLiteral("Nicht gesendet"), g_not_synced_why);
+        toast(true, QStringLiteral("Not sent"), g_not_synced_why);
         if (online()) {
             sync_pending();
         }
@@ -1994,7 +2025,9 @@ void _nh_ReadingView__leavingReadingExperience(ReadingView *self)
         }
         return;
     }
-    when_online(kWifiLeaveWaitS, [id] { start_push(id); });
+    when_online(kWifiLeaveWaitS, [id] {
+        QTimer::singleShot(kPushAfterLeaveDelayMs, qApp, [id] { start_push(id); });
+    });
 }
 
 // NickelHook's GOT patcher (plugin/NickelHook/nh.c, linked into this
@@ -2074,8 +2107,7 @@ static int nickelinksync_init()
                      .arg(QLatin1String(QT_VERSION >= 0x060000 ? "6.0" : "4.38")));
         return 0;
     }
-    // The messages are German; the locale is logged to learn whether the
-    // device language can be told from it.
+    // The locale is logged for diagnostics.
     log_line(QStringLiteral("active on a %1 (Qt %7), CLI and configuration in %2; notify = %3, toasts %4, locale %5 (system %6)")
                  .arg(QLatin1String(g_kobo ? "Kobo" : "Tolino"))
                  .arg(QString::fromLatin1(kDir))

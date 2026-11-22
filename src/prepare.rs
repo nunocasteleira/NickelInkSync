@@ -1,7 +1,8 @@
 //! Preparing a Kobo or Tolino for syncing on its own (`--live`, run by the
 //! plugin): what the CLI on the device needs of the desktop's library and
-//! mappings, in `<device>/.adds/NickelInkSync/`. Nothing else on the
-//! device is written, and the original EPUBs never go onto it.
+//! mappings, in `<device>/.adds/NickelInkSync/`. Desktop preparation writes
+//! only indexes, mappings and tables. The CWA live adapter may also keep a
+//! downloaded original EPUB in its private `originals` directory.
 //!
 //! - `library.json`, the **library index**: title, authors and KOReader
 //!   partial MD5 of every original EPUB in the library. On the device a
@@ -270,20 +271,25 @@ pub fn prepare(
   let mut on_device: HashMap<String, OnDevice> = HashMap::new();
   for book in device.db.sideloaded_books()? {
     let file = device.book_file(&book);
+    // Libra Colour keeps stale UUID rows in `content` after a book is gone;
+    // do not report those as read errors when resolving its `.kobo/kepub`
+    // layout. Missing legacy paths remain errors because they indicate a
+    // damaged or unexpectedly changed device database.
+    if book.is_kepub() && book.onboard_path() == book.content_id && !file.is_file() {
+      continue;
+    }
     match partial_md5(&file) {
       Ok(hash) => {
         on_device.insert(
           hash,
           OnDevice {
-            path: book.onboard_path().to_string(),
+            path: book.storage_path(),
             title: book.title.clone(),
             file,
           },
         );
       }
-      Err(e) => report
-        .failed
-        .push((book.onboard_path().to_string(), e.to_string())),
+      Err(e) => report.failed.push((book.storage_path(), e.to_string())),
     }
   }
 
@@ -471,5 +477,52 @@ pub fn put_mapping(root: &Path, mapping: &Mapping) -> Result<()> {
   device.mappings.push(mapping.clone());
   device.removed.retain(|r| r != hash);
   write_atomic(&dir.join(MAPPINGS), &json(&device, true))?;
+  Ok(())
+}
+
+/// Puts a mapping made by the live CWA adapter onto the device. Unlike the
+/// desktop mapping path this also creates the small library index needed by
+/// the live session, because the original EPUB was downloaded to the device.
+pub fn put_live_mapping(root: &Path, mapping: &Mapping) -> Result<()> {
+  let DeviceBook::File { hash, path, .. } = &mapping.device else {
+    return Err("only a Kobo or Tolino book has a table".into());
+  };
+  let dir = root.join(DIR);
+  let table = build_table(&root.join(path), hash, mapping)?;
+  write_atomic(&Table::path(&dir, hash), &json(&table, false))?;
+
+  let mut device = read::<DeviceMappings>(&dir.join(MAPPINGS))?.unwrap_or_default();
+  device.format = FORMAT;
+  device
+    .mappings
+    .retain(|m| !m.device.same_as(&mapping.device));
+  device.added.retain(|m| !m.device.same_as(&mapping.device));
+  device.removed.retain(|r| r != hash);
+  device.added.push(mapping.clone());
+  write_atomic(&dir.join(MAPPINGS), &json(&device, true))?;
+
+  let mut index = read::<Index>(&dir.join(LIBRARY))?.unwrap_or_else(|| Index {
+    format: FORMAT,
+    created: now(),
+    books: Vec::new(),
+  });
+  index.format = FORMAT;
+  if !index
+    .books
+    .iter()
+    .any(|book| book.hash == mapping.epub.hash)
+  {
+    index.books.push(IndexBook {
+      hash: mapping.epub.hash.clone(),
+      title: mapping.epub.title.clone(),
+      authors: mapping
+        .epub
+        .author
+        .as_deref()
+        .map(|author| vec![author.to_string()])
+        .unwrap_or_default(),
+    });
+  }
+  write_atomic(&dir.join(LIBRARY), &json(&index, false))?;
   Ok(())
 }
